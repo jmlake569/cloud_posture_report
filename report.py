@@ -355,7 +355,11 @@ if __name__ == "__main__":
                         "categories": ', '.join(check.get("categories", [])) if isinstance(check.get("categories"), list) else check.get("categories", ""),
                         "description": check.get("description"),
                         "status_updated_time": check.get("statusUpdatedDateTime"),
-                        "created_time": check.get("createdDateTime")
+                        "created_time": check.get("createdDateTime"),
+                        "failure_discovered_time": check.get("failureDiscoveredDateTime"),
+                        "failed_by": check.get("failedBy"),
+                        "resolved_time": check.get("resolvedDateTime"),
+                        "resolved_by": check.get("resolvedBy")
                     }
                     
                     if check.get("status") == "SUCCESS":
