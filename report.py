@@ -7,10 +7,281 @@ import time
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Optional, Tuple
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+
+# Centralized configuration and utilities
+class Config:
+    """Centralized configuration to eliminate duplication"""
+    
+    def __init__(self, args):
+        self.session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.base_url = "https://api.xdr.trendmicro.com"
+        self.headers = {
+            'Authorization': 'Bearer ' + args.token,
+            'Content-Type': 'application/json',
+            'api-version': 'v1'
+        }
+        self.timeframe = args.timeframe
+        self.risk_levels = args.risk_levels
+        self.max_workers = args.max_workers
+        self.service_workers = args.service_workers
+        self.batch_size = args.batch_size
+        self.resume = args.resume
+        
+        # Status filter logic
+        if args.all:
+            self.status_filter = "all"
+        elif args.successes:
+            self.status_filter = "successes"
+        elif args.failures:
+            self.status_filter = "failures"
+        else:
+            self.status_filter = "failures"  # Default
+
+class DateUtils:
+    """Centralized date processing to eliminate duplication"""
+    
+    @staticmethod
+    def get_date_range(timeframe: int, for_success: bool = False) -> Tuple[datetime, datetime]:
+        """Get standardized date range for API requests"""
+        end_date = datetime.now(timezone.utc)
+        
+        if for_success:
+            # Expand range for SUCCESS queries to capture recently resolved items
+            start_date = end_date - timedelta(days=timeframe * 10)
+        else:
+            # Normal timeframe for FAILURE items
+            start_date = end_date - timedelta(days=timeframe)
+            
+        return start_date, end_date
+    
+    @staticmethod
+    def parse_api_date(date_str: str) -> Optional[datetime]:
+        """Centralized date parsing with error handling"""
+        if not date_str:
+            return None
+            
+        try:
+            if 'Z' in date_str:
+                return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+            else:
+                return datetime.fromisoformat(date_str)
+        except:
+            return None
+    
+    @staticmethod
+    def format_date_for_api(date: datetime) -> str:
+        """Format date for API requests"""
+        return date.isoformat().replace('+00:00', 'Z')
+
+class FilterBuilder:
+    """Centralized filter construction to eliminate duplication"""
+    
+    @staticmethod
+    def build_base_filter(account_id: str, risk_levels: List[str]) -> List[str]:
+        """Build base filter conditions"""
+        conditions = [f'accountId eq \'{account_id}\'']
+        
+        # Add risk level filtering
+        if len(risk_levels) < 5:  # Only add filter if not all risk levels selected
+            if len(risk_levels) == 1:
+                conditions.append(f'riskLevel eq \'{risk_levels[0]}\'')
+            else:
+                risk_conditions = [f'riskLevel eq \'{level}\'' for level in risk_levels]
+                risk_filter = '(' + ' or '.join(risk_conditions) + ')'
+                conditions.append(risk_filter)
+        
+        return conditions
+    
+    @staticmethod
+    def build_status_filter(base_conditions: List[str], status: str) -> str:
+        """Build complete filter with status"""
+        status_conditions = base_conditions + [f'status eq \'{status}\'']
+        return ' and '.join(status_conditions)
+    
+    @staticmethod
+    def build_service_filter(base_conditions: List[str], service: str) -> str:
+        """Build filter for specific service"""
+        service_conditions = base_conditions + [f'service eq \'{service}\'']
+        return ' and '.join(service_conditions)
+
+class APIClient:
+    """Centralized API client to eliminate request duplication"""
+    
+    def __init__(self, config: Config, rate_limiter):
+        self.config = config
+        self.rate_limiter = rate_limiter
+    
+    def make_request(self, url: str, headers: Dict = None, params: Dict = None, 
+                    max_retries: int = 5) -> Dict:
+        """Centralized API request with rate limiting and error handling"""
+        if headers is None:
+            headers = self.config.headers
+        
+        retries = 0
+        while retries < max_retries:
+            try:
+                response = requests.get(url, headers=headers, params=params, timeout=30)
+                logging.info(f"Request to {url} - Status Code: {response.status_code}")
+                
+                if response.status_code == 200:
+                    return {'success': True, 'data': response.json()}
+                elif response.status_code == 429:
+                    if self.rate_limiter.handle_rate_limit(retries):
+                        retries += 1
+                        continue
+                    else:
+                        return {'success': False, 'error': 'rate_limit_exceeded'}
+                else:
+                    return {'success': False, 'error': f'http_{response.status_code}'}
+                    
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Request failed: {e}")
+                if retries < max_retries:
+                    retries += 1
+                    time.sleep(2 ** retries)
+                    continue
+                return {'success': False, 'error': str(e)}
+        
+        return {'success': False, 'error': 'max_retries_exceeded'}
+
+class ServiceManager:
+    """Centralized service management to eliminate duplication"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self._official_services_cache = None
+    
+    def get_official_services(self) -> List[str]:
+        """Get official service list (cached)"""
+        if self._official_services_cache is not None:
+            return self._official_services_cache
+        
+        try:
+            print("🌐 Fetching official service list from Trend Vision One API...")
+            response = requests.get("https://us-west-2.cloudconformity.com/v1/services", timeout=30)
+            if response.status_code == 200:
+                services_data = response.json()
+                service_ids = [service['id'] for service in services_data.get('data', [])]
+                self._official_services_cache = service_ids
+                print(f"✅ Fetched {len(service_ids)} official services from Trend Vision One")
+                return service_ids
+            else:
+                print(f"⚠️ Could not fetch official service list (HTTP {response.status_code}), using fallback")
+                self._official_services_cache = self._get_fallback_services()
+                return self._official_services_cache
+        except Exception as e:
+            print(f"⚠️ Error fetching official service list: {e}, using fallback")
+            self._official_services_cache = self._get_fallback_services()
+            return self._official_services_cache
+    
+    def _get_fallback_services(self) -> List[str]:
+        """Fallback service list"""
+        return [
+            # AWS Services
+            'EC2', 'S3', 'RDS', 'Lambda', 'IAM', 'VPC', 'ELB', 'CloudTrail', 'CloudWatch', 'EKS', 'ECS',
+            'KMS', 'SNS', 'SQS', 'DynamoDB', 'ElastiCache', 'Redshift', 'EMR', 'Route53', 'ACM',
+            'Config', 'ConfigService', 'GuardDuty', 'SecurityHub', 'Inspector', 'WAF', 'Shield', 'EBS',
+            'ELBv2', 'APIGateway', 'AutoScaling', 'Backup', 'CloudFormation', 'CloudFront', 'ECR', 'EFS',
+            
+            # GCP Services
+            'Compute Engine', 'Cloud Storage', 'Cloud SQL', 'Cloud Functions', 'Cloud IAM', 'GKE',
+            'Cloud KMS', 'Cloud Pub/Sub', 'Cloud Datastore', 'Cloud Firestore', 'Cloud DNS',
+            
+            # Azure Services
+            'Virtual Machines', 'Storage Accounts', 'SQL Database', 'Azure Functions', 'Azure AD', 'AKS',
+            'Key Vault', 'Service Bus', 'Cosmos DB', 'Application Gateway', 'Front Door'
+        ]
+
+class RecordProcessor:
+    """Centralized record processing to eliminate duplication"""
+    
+    @staticmethod
+    def create_comprehensive_record(check: Dict, account: Dict) -> Dict:
+        """Create comprehensive record with all available fields"""
+        return {
+            # Check identifiers
+            "check_id": check.get("id"),
+            "account_id": account['id'],
+            "account_name": account['name'],
+            "organization_id": check.get("organizationId"),
+            
+            # Cloud provider info
+            "provider": account['provider'],
+            "aws_account_id": account.get('aws_account_id', ''),
+            "gcp_project_id": account.get('gcp_project_id', ''),
+            "azure_subscription_id": account.get('azure_subscription_id', ''),
+            "resource_count": account['resource_count'],
+            
+            # Check status and timing
+            "status": check.get("status"),
+            "created_time": check.get("createdDateTime"),
+            "updated_time": check.get("updatedDateTime"),
+            "status_updated_time": check.get("statusUpdatedDateTime"),
+            "failure_discovered_time": check.get("failureDiscoveredDateTime"),
+            "resolved_time": check.get("resolvedDateTime"),
+            
+            # Rule and resource details
+            "rule_id": check.get("ruleId"),
+            "rule_title": check.get("ruleTitle"),
+            "is_custom_rule": check.get("isCustom", False),
+            "resource_id": check.get("resourceId"),
+            "resource": check.get("resource"),
+            "resource_name": check.get("resourceName"),
+            "resource_type": check.get("resourceType"),
+            "resource_link": check.get("resourceLink"),
+            "service": check.get("service"),
+            "region": check.get("region"),
+            
+            # Risk and compliance
+            "risk_level": check.get("riskLevel"),
+            "categories": ', '.join(check.get("categories", [])) if isinstance(check.get("categories"), list) else check.get("categories", ""),
+            "compliances": ', '.join(check.get("compliances", [])) if isinstance(check.get("compliances"), list) else check.get("compliances", ""),
+            "description": check.get("description"),
+            "resolution_page_url": check.get("resolutionPageUrl"),
+            
+            # Management fields
+            "failed_by": check.get("failedBy"),
+            "resolved_by": check.get("resolvedBy"),
+            "note": check.get("note"),
+            "suppressed": check.get("suppressed", False),
+            "suppressed_until": check.get("suppressedUntilDateTime"),
+            "excluded": check.get("excluded", False),
+            "ignored": check.get("ignored", False),
+            "not_scored": check.get("notScored", False),
+            
+            # Additional metadata
+            "tags": ', '.join(check.get("tags", [])) if isinstance(check.get("tags"), list) else check.get("tags", ""),
+            "event_id": check.get("eventId"),
+            "ttl_time": check.get("ttlDateTime"),
+            
+            # Extra data
+            "extra_data": json.dumps(check.get("extraData", [])) if check.get("extraData") else ""
+        }
+    
+    @staticmethod
+    def should_include_check(check: Dict, timeframe: int, status: str) -> bool:
+        """Centralized logic for determining if check should be included"""
+        filter_start, filter_end = DateUtils.get_date_range(timeframe, status == "SUCCESS")
+        
+        if status == "SUCCESS":
+            # Include if recently resolved
+            resolved_date = DateUtils.parse_api_date(check.get('resolvedDateTime'))
+            return resolved_date and filter_start <= resolved_date <= filter_end
+        
+        elif status == "FAILURE":
+            # Include if currently failing (check multiple date fields)
+            date_fields = ['failureDiscoveredDateTime', 'statusUpdatedDateTime', 'updatedDateTime']
+            for date_field in date_fields:
+                check_date = DateUtils.parse_api_date(check.get(date_field))
+                if check_date and filter_start <= check_date <= filter_end:
+                    return True
+            return False
+        
+        return False
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
@@ -443,31 +714,14 @@ class ServiceConcurrencyManager:
 args = parse_arguments()
 
 # Configuration
-session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
-BASE_URL = "https://api.xdr.trendmicro.com"
-
-headers = {
-    'Authorization': 'Bearer ' + args.token,
-    'Content-Type': 'application/json',
-    'api-version': 'v1'
-}
-
-# Handle status filtering logic
-if args.all:
-    status_filter = "all"
-elif args.successes:
-    status_filter = "successes"  
-elif args.failures:
-    status_filter = "failures"
-else:
-    status_filter = "failures"  # Default
+config = Config(args)
 
 # Initialize components
 rate_limiter = RateLimitHandler()
-progress_tracker = ProgressTracker(session_id)
-streaming_reporter = StreamingReporter(session_id, args.batch_size, args.timeframe, status_filter)
+progress_tracker = ProgressTracker(config.session_id)
+streaming_reporter = StreamingReporter(config.session_id, config.batch_size, config.timeframe, config.status_filter)
 service_concurrency_manager = ServiceConcurrencyManager(
-    max_concurrent_services=args.service_workers,
+    max_concurrent_services=config.service_workers,
     rate_limit_delay=0.05  # Reduced from 0.2s for better performance
 )
 
@@ -485,40 +739,40 @@ _official_services_cache = None
 
 # Setup logging
 logging.basicConfig(
-    filename=f'api_audit_{session_id}.log', 
+    filename=f'api_audit_{config.session_id}.log', 
     level=logging.INFO, 
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-print(f"🚀 Cloud Posture Report (Session: {session_id})")
-print(f"📊 Optimized for 50+ accounts with {args.max_workers} concurrent workers")
-print(f"⚡ Service concurrency: {args.service_workers} parallel service requests per account")
+print(f"🚀 Cloud Posture Report (Session: {config.session_id})")
+print(f"📊 Optimized for 50+ accounts with {config.max_workers} concurrent workers")
+print(f"⚡ Service concurrency: {config.service_workers} parallel service requests per account")
 print(f"🔄 10K+ result handling: Auto-chunking by risk level")
 print(f"⚡ Performance: Separate API requests for failures/successes (faster & more reliable)")
 
 # Explain what we're actually tracking based on status filter
-if status_filter == "successes":
-    print(f"🔧 Focus: Issues RESOLVED in last {args.timeframe} days (SUCCESS status)")
-elif status_filter == "failures":
-    print(f"🔧 Focus: Current FAILURES from last {args.timeframe} days (FAILURE status)")
+if config.status_filter == "successes":
+    print(f"🔧 Focus: Issues RESOLVED in last {config.timeframe} days (SUCCESS status)")
+elif config.status_filter == "failures":
+    print(f"🔧 Focus: Current FAILURES from last {config.timeframe} days (FAILURE status)")
 else:  # all
-    print(f"🔧 Focus: Recent fixes AND current failures from last {args.timeframe} days (separate requests)")
+    print(f"🔧 Focus: Recent fixes AND current failures from last {config.timeframe} days (separate requests)")
 
-print(f"Status filter: {status_filter.title()}")
-print(f"Risk levels: {', '.join(args.risk_levels)} {'(excludes LOW findings)' if 'LOW' not in args.risk_levels else '(includes ALL risk levels)'}")
+print(f"Status filter: {config.status_filter.title()}")
+print(f"Risk levels: {', '.join(config.risk_levels)} {'(excludes LOW findings)' if 'LOW' not in config.risk_levels else '(includes ALL risk levels)'}")
 print(f"Provider filter: All providers (AWS, Azure, GCP)")
 
-if args.resume:
+if config.resume:
     print(f"🔄 Resume mode: Skipping {len(progress_tracker.completed_accounts)} completed accounts")
 
 def get_accounts():
     """Fetch all accounts with rate limiting"""
-    account_url = f"{BASE_URL}/beta/cloudPosture/accounts"
+    account_url = f"{config.base_url}/beta/cloudPosture/accounts"
     retries = 0
     
     while True:
         try:
-            response = requests.get(account_url, headers=headers, timeout=30)
+            response = requests.get(account_url, headers=config.headers, timeout=30)
             logging.info(f"Request to {account_url} - Status Code: {response.status_code}")
             
             if response.status_code == 200:
@@ -572,51 +826,39 @@ def get_checks_for_account(account: Dict) -> Dict:
     account_name = account['name']
     
     # Skip if already completed and resuming
-    if args.resume and progress_tracker.is_completed(account_id):
+    if config.resume and progress_tracker.is_completed(account_id):
         print(f"⏭️  Skipping {account_name} (already completed)")
         return {'items': [], 'account_name': account_name, 'account_id': account_id, 'skipped': True}
     
     print(f"🔄 [{account_name}] Starting data collection...")
     
     # Build base filter (accountId + risk levels, but NOT status yet)
-    base_filter_conditions = [f'accountId eq \'{account_id}\'']
-    
-    # Add risk level filtering to base
-    if len(args.risk_levels) < 5:  # Only add filter if not all risk levels selected
-        if len(args.risk_levels) == 1:
-            # Single risk level
-            base_filter_conditions.append(f'riskLevel eq \'{args.risk_levels[0]}\'')
-        else:
-            # Multiple risk levels - use OR condition
-            risk_conditions = [f'riskLevel eq \'{level}\'' for level in args.risk_levels]
-            risk_filter = '(' + ' or '.join(risk_conditions) + ')'
-            base_filter_conditions.append(risk_filter)
-    
-    # Always make separate requests for better performance and reliability
-    all_checks = []
-    requests_made = []
+    base_filter_conditions = FilterBuilder.build_base_filter(account_id, config.risk_levels)
     
     # Determine which status requests to make
-    if args.all:
+    if config.status_filter == "all":
         status_requests = ['FAILURE', 'SUCCESS']
         print(f"🔧 [{account_name}] Making separate requests for failures and successes")
-    elif status_filter == "failures":
+    elif config.status_filter == "failures":
         status_requests = ['FAILURE']
         print(f"🔧 [{account_name}] Requesting failures only")
-    elif status_filter == "successes":
+    elif config.status_filter == "successes":
         status_requests = ['SUCCESS']
         print(f"🔧 [{account_name}] Requesting successes only")
     
     # Make separate requests for each status
+    all_checks = []
+    requests_made = []
+    
     for status in status_requests:
         print(f"  📡 [{account_name}] Fetching {status} checks...")
         
         # Build filter conditions for this specific status
-        status_filter_conditions = base_filter_conditions + [f'status eq \'{status}\'']
+        status_filter_conditions = FilterBuilder.build_status_filter(base_filter_conditions, status)
         
         # Always use comprehensive service chunking for maximum completeness and zero duplication
         resource_count = account.get('resource_count', 0)
-        risk_summary = f"risk levels: {', '.join(args.risk_levels)}" if len(args.risk_levels) < 5 else "all risk levels"
+        risk_summary = f"risk levels: {', '.join(config.risk_levels)}" if len(config.risk_levels) < 5 else "all risk levels"
         print(f"    🔧 [{account_name}] Using comprehensive service chunking for {status} ({resource_count} resources, {risk_summary})")
         
         # Use service chunking for this status
@@ -659,22 +901,20 @@ def get_checks_for_account(account: Dict) -> Dict:
 
 def _fetch_checks_with_filter(account_name: str, filter_string: str, max_pages: int = 50) -> Dict:
     """Fetch checks with a specific filter, detecting 10K limit"""
-    checks_url = f"{BASE_URL}/beta/cloudPosture/checks"
+    checks_url = f"{config.base_url}/beta/cloudPosture/checks"
     
     # Date filtering - expand range for SUCCESS queries to capture recently resolved items
     if 'status eq \'SUCCESS\'' in filter_string:
         # For SUCCESS items, expand date range since we filter by resolvedDateTime in post-processing
         # A check could be created months ago but resolved recently
-        start_date = datetime.now(timezone.utc) - timedelta(days=args.timeframe * 10)  # 10x wider range
-        end_date = datetime.now(timezone.utc)
-        print(f"📅 [{account_name}] Expanding date range for SUCCESS queries: {args.timeframe * 10} days")
+        start_date, end_date = DateUtils.get_date_range(config.timeframe, True)
+        print(f"📅 [{account_name}] Expanding date range for SUCCESS queries: {config.timeframe * 10} days")
     else:
         # For FAILURE items, use normal timeframe
-        start_date = datetime.now(timezone.utc) - timedelta(days=args.timeframe)
-        end_date = datetime.now(timezone.utc)
+        start_date, end_date = DateUtils.get_date_range(config.timeframe, False)
     
-    start_date_str = start_date.isoformat().replace('+00:00', 'Z')
-    end_date_str = end_date.isoformat().replace('+00:00', 'Z')
+    start_date_str = DateUtils.format_date_for_api(start_date)
+    end_date_str = DateUtils.format_date_for_api(end_date)
     
     params = {
         'top': 200,  # Max per page
@@ -683,7 +923,7 @@ def _fetch_checks_with_filter(account_name: str, filter_string: str, max_pages: 
         'dateTimeTarget': 'createdDate'
     }
     
-    headers_with_filter = headers.copy()
+    headers_with_filter = config.headers.copy()
     headers_with_filter['TMV1-Filter'] = filter_string
     
     all_checks = []
@@ -771,7 +1011,7 @@ def _get_checks_with_comprehensive_service_chunking(account_name: str, base_filt
     print(f"🔄 [{account_name}] Starting comprehensive service chunking for {status_type}...")
     
     # Get official service list from Trend Vision One API
-    official_services = _get_official_service_list()
+    official_services = service_concurrency_manager.get_official_services()
     
     # Use concurrent service processing for major performance improvement
     result = service_concurrency_manager.fetch_services_concurrently(
@@ -813,7 +1053,7 @@ def _get_checks_with_chunking(account_name: str, base_filter_conditions: List[st
 def _chunk_by_risk_levels(account_name: str, base_filter_conditions: List[str]) -> Dict:
     """Chunk by risk levels, with service chunking fallback if still hitting limits"""
     # Use user-selected risk levels instead of hardcoded ones
-    risk_levels = args.risk_levels
+    risk_levels = config.risk_levels
     all_items = []
     
     for risk_level in risk_levels:
@@ -842,56 +1082,17 @@ def _chunk_by_risk_levels(account_name: str, base_filter_conditions: List[str]) 
     return {'success': True, 'items': all_items}
 
 def _get_official_service_list() -> List[str]:
-    """Fetch the official service list from Trend Vision One Cloud Posture API (cached per session)"""
-    global _official_services_cache
-    
-    # Return cached list if already fetched
-    if _official_services_cache is not None:
-        return _official_services_cache
-    
-    services_url = "https://us-west-2.cloudconformity.com/v1/services"
-    
-    try:
-        print("🌐 Fetching official service list from Trend Vision One API...")
-        response = requests.get(services_url, timeout=30)
-        if response.status_code == 200:
-            services_data = response.json()
-            service_ids = [service['id'] for service in services_data.get('data', [])]
-            _official_services_cache = service_ids  # Cache the result
-            print(f"✅ Fetched {len(service_ids)} official services from Trend Vision One")
-            print(f"    Sample services: {', '.join(service_ids[:10])}{'...' if len(service_ids) > 10 else ''}")
-            return service_ids
-        else:
-            print(f"⚠️ Could not fetch official service list (HTTP {response.status_code}), using fallback")
-            _official_services_cache = _get_fallback_service_list()
-            return _official_services_cache
-    except Exception as e:
-        print(f"⚠️ Error fetching official service list: {e}, using fallback")
-        _official_services_cache = _get_fallback_service_list()
-        return _official_services_cache
+    """Get official service list using centralized service manager"""
+    return service_manager.get_official_services()
 
 def _get_fallback_service_list() -> List[str]:
-    """Fallback service list in case the API is unavailable"""
-    return [
-        # AWS Services (most common)
-        'EC2', 'S3', 'RDS', 'Lambda', 'IAM', 'VPC', 'ELB', 'CloudTrail', 'CloudWatch', 'EKS', 'ECS',
-        'KMS', 'SNS', 'SQS', 'DynamoDB', 'ElastiCache', 'Redshift', 'EMR', 'Route53', 'ACM',
-        'Config', 'ConfigService', 'GuardDuty', 'SecurityHub', 'Inspector', 'WAF', 'Shield', 'EBS',
-        'ELBv2', 'APIGateway', 'AutoScaling', 'Backup', 'CloudFormation', 'CloudFront', 'ECR', 'EFS',
-        
-        # GCP Services
-        'Compute Engine', 'Cloud Storage', 'Cloud SQL', 'Cloud Functions', 'Cloud IAM', 'GKE',
-        'Cloud KMS', 'Cloud Pub/Sub', 'Cloud Datastore', 'Cloud Firestore', 'Cloud DNS',
-        
-        # Azure Services
-        'Virtual Machines', 'Storage Accounts', 'SQL Database', 'Azure Functions', 'Azure AD', 'AKS',
-        'Key Vault', 'Service Bus', 'Cosmos DB', 'Application Gateway', 'Front Door'
-    ]
+    """Get fallback service list using centralized service manager"""
+    return service_manager._get_fallback_services()
 
 def _chunk_risk_level_by_services(account_name: str, risk_filter_conditions: List[str]) -> List[Dict]:
     """Further chunk a specific risk level by services when it still hits 10K limit"""
     # Get official service list from Trend Vision One API
-    common_services = _get_official_service_list()
+    common_services = service_concurrency_manager.get_official_services()
     
     print(f"  🔍 [{account_name}] Checking {len(common_services)} official services from Trend Vision One...")
     
@@ -1040,8 +1241,7 @@ def process_checks_for_account(account: Dict, checks_info: Dict):
     failures_count = 0
     
     # Define the timeframe for filtering
-    filter_start = datetime.now(timezone.utc) - timedelta(days=args.timeframe)
-    filter_end = datetime.now(timezone.utc)
+    filter_start, filter_end = DateUtils.get_date_range(config.timeframe, config.status_filter == "SUCCESS")
     
     for check in checks:
         status = check.get("status")
@@ -1050,18 +1250,9 @@ def process_checks_for_account(account: Dict, checks_info: Dict):
         # Logic based on what we're actually trying to track:
         if status == "SUCCESS":
             # For SUCCESS items: Include if recently resolved (fixed issues)
-            resolved_date_str = check.get('resolvedDateTime')
-            if resolved_date_str:
-                try:
-                    if 'Z' in resolved_date_str:
-                        resolved_date = datetime.fromisoformat(resolved_date_str.replace('Z', '+00:00'))
-                    else:
-                        resolved_date = datetime.fromisoformat(resolved_date_str)
-                    
-                    if filter_start <= resolved_date <= filter_end:
-                        include_check = True
-                except:
-                    pass
+            resolved_date = DateUtils.parse_api_date(check.get('resolvedDateTime'))
+            if resolved_date and filter_start <= resolved_date <= filter_end:
+                include_check = True
         
         elif status == "FAILURE":
             # For FAILURE items: Include if currently failing (discovered/updated recently)
@@ -1069,83 +1260,16 @@ def process_checks_for_account(account: Dict, checks_info: Dict):
             date_fields = ['failureDiscoveredDateTime', 'statusUpdatedDateTime', 'updatedDateTime']
             
             for date_field in date_fields:
-                date_str = check.get(date_field)
-                if date_str:
-                    try:
-                        if 'Z' in date_str:
-                            check_date = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-                        else:
-                            check_date = datetime.fromisoformat(date_str)
-                        
-                        if filter_start <= check_date <= filter_end:
-                            include_check = True
-                            break
-                    except:
-                        continue
+                check_date = DateUtils.parse_api_date(check.get(date_field))
+                if check_date and filter_start <= check_date <= filter_end:
+                    include_check = True
+                    break
         
         if not include_check:
             continue
         
         # Create comprehensive record with all available API fields
-        record = {
-            # Check identifiers
-            "check_id": check.get("id"),
-            "account_id": account['id'],
-            "account_name": account['name'],
-            "organization_id": check.get("organizationId"),
-            
-            # Cloud provider info
-            "provider": account['provider'],
-            "aws_account_id": account.get('aws_account_id', ''),
-            "gcp_project_id": account.get('gcp_project_id', ''),
-            "azure_subscription_id": account.get('azure_subscription_id', ''),
-            "resource_count": account['resource_count'],
-            
-            # Check status and timing
-            "status": status,
-            "created_time": check.get("createdDateTime"),
-            "updated_time": check.get("updatedDateTime"),
-            "status_updated_time": check.get("statusUpdatedDateTime"),
-            "failure_discovered_time": check.get("failureDiscoveredDateTime"),
-            "resolved_time": check.get("resolvedDateTime"),
-            
-            # Rule and resource details
-            "rule_id": check.get("ruleId"),
-            "rule_title": check.get("ruleTitle"),
-            "is_custom_rule": check.get("isCustom", False),
-            "resource_id": check.get("resourceId"),
-            "resource": check.get("resource"),
-            "resource_name": check.get("resourceName"),
-            "resource_type": check.get("resourceType"),
-            "resource_link": check.get("resourceLink"),
-            "service": check.get("service"),
-            "region": check.get("region"),
-            
-            # Risk and compliance
-            "risk_level": check.get("riskLevel"),
-            "categories": ', '.join(check.get("categories", [])) if isinstance(check.get("categories"), list) else check.get("categories", ""),
-            "compliances": ', '.join(check.get("compliances", [])) if isinstance(check.get("compliances"), list) else check.get("compliances", ""),
-            "description": check.get("description"),
-            "resolution_page_url": check.get("resolutionPageUrl"),
-            
-            # Management fields
-            "failed_by": check.get("failedBy"),
-            "resolved_by": check.get("resolvedBy"),
-            "note": check.get("note"),
-            "suppressed": check.get("suppressed", False),
-            "suppressed_until": check.get("suppressedUntilDateTime"),
-            "excluded": check.get("excluded", False),
-            "ignored": check.get("ignored", False),
-            "not_scored": check.get("notScored", False),
-            
-            # Additional metadata
-            "tags": ', '.join(check.get("tags", [])) if isinstance(check.get("tags"), list) else check.get("tags", ""),
-            "event_id": check.get("eventId"),
-            "ttl_time": check.get("ttlDateTime"),
-            
-            # Extra data (flatten if present)
-            "extra_data": json.dumps(check.get("extraData", [])) if check.get("extraData") else ""
-        }
+        record = RecordProcessor.create_comprehensive_record(check, account)
         
         streaming_reporter.add_record(record, status)
         
@@ -1168,7 +1292,7 @@ def main():
         return
     
     # Filter out already completed accounts if resuming
-    if args.resume:
+    if config.resume:
         accounts_to_process = [acc for acc in accounts_info if not progress_tracker.is_completed(acc['id'])]
         print(f"📝 Processing {len(accounts_to_process)} remaining accounts (skipping {len(accounts_info) - len(accounts_to_process)} completed)")
     else:
@@ -1178,7 +1302,7 @@ def main():
         print("✅ All accounts already processed!")
         return
     
-    print(f"\n🏭 Processing {len(accounts_to_process)} accounts with {args.max_workers} workers:")
+    print(f"\n🏭 Processing {len(accounts_to_process)} accounts with {config.max_workers} workers:")
     for account in accounts_to_process:
         print(f"  - {account['name']} ({account['provider'].upper()}) - {account['resource_count']} resources")
     
@@ -1187,7 +1311,7 @@ def main():
     processed_count = 0
     
     # Process accounts concurrently
-    with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
         # Submit all account processing jobs
         future_to_account = {
             executor.submit(get_checks_for_account, account): account 
@@ -1235,9 +1359,9 @@ def main():
     print(f"📈 Rate: {processed_count / elapsed_time.total_seconds() * 60:.1f} accounts/minute")
     
     # Show filtering applied
-    risk_summary = f"Risk levels: {', '.join(args.risk_levels)}" if len(args.risk_levels) < 5 else "All risk levels"
-    print(f"🔧 Filters applied: {status_filter.title()} status, {risk_summary}")
-    print(f"⚡ Concurrency: {args.max_workers} accounts × {args.service_workers} services = {args.max_workers * args.service_workers} total concurrent requests")
+    risk_summary = f"Risk levels: {', '.join(config.risk_levels)}" if len(config.risk_levels) < 5 else "All risk levels"
+    print(f"🔧 Filters applied: {config.status_filter.title()} status, {risk_summary}")
+    print(f"⚡ Concurrency: {config.max_workers} accounts × {config.service_workers} services = {config.max_workers * config.service_workers} total concurrent requests")
     
     # Generate final report
     print(f"\n📄 Generating final report...")
@@ -1249,7 +1373,7 @@ def main():
     
     # Cleanup
     progress_tracker.cleanup()
-    print(f"✨ Session {session_id} completed successfully!")
+    print(f"✨ Session {config.session_id} completed successfully!")
 
 def _print_service_discovery_report():
     """Print comprehensive service discovery and completeness report"""
@@ -1303,7 +1427,7 @@ def _print_service_discovery_report():
     
     print(f"\n💡 Completeness & Performance Notes:")
     print(f"  • 🔧 All accounts use comprehensive service chunking (zero duplication)")
-    print(f"  • ⚡ Service-level concurrency: {args.service_workers} parallel requests per account")
+    print(f"  • ⚡ Service-level concurrency: {config.service_workers} parallel requests per account")
     print(f"  • 📋 Service list auto-synced with official Trend Vision One API")
     print(f"  • ⚠️  Individual service 10K limits: use --timeframe 7 for complete data")
     print(f"  • 🎯 Each service queried separately for maximum accuracy")
